@@ -9,12 +9,73 @@ from openpyxl import load_workbook
 # 環境変数の読み込み
 load_dotenv()
 
-# SerpAPIキーを取得
-SERPAPI_KEY = os.getenv("SERPAPI_KEY")
+# 複数のSerpAPIキーを取得（Streamlit Cloud対応）
+def load_api_keys():
+    """複数のSerpAPIキーを読み込む"""
+    api_keys = []
+    
+    try:
+        # Streamlit Cloudの場合はst.secretsから取得
+        for i in range(1, 11):  # 最大10個のキーをサポート
+            key_name = f"SERPAPI_KEY{i}" if i > 1 else "SERPAPI_KEY"
+            key = st.secrets.get(key_name, None)
+            if key and key != "your_serpapi_key_here":
+                api_keys.append(key)
+    except:
+        # ローカル環境の場合は.envから取得
+        for i in range(1, 11):  # 最大10個のキーをサポート
+            key_name = f"SERPAPI_KEY{i}" if i > 1 else "SERPAPI_KEY"
+            key = os.getenv(key_name)
+            if key and key != "your_serpapi_key_here":
+                api_keys.append(key)
+    
+    return api_keys
+
+# APIキーリストを取得
+API_KEYS = load_api_keys()
+
+# セッションステートの初期化（現在使用中のキーのインデックス）
+if 'current_api_key_index' not in st.session_state:
+    st.session_state.current_api_key_index = 0
+if 'failed_api_keys' not in st.session_state:
+    st.session_state.failed_api_keys = set()
+
+def get_current_api_key():
+    """現在使用可能なAPIキーを取得"""
+    if not API_KEYS:
+        return None
+    
+    # 失敗したキーを除外して利用可能なキーを取得
+    available_keys = [key for i, key in enumerate(API_KEYS) 
+                      if i not in st.session_state.failed_api_keys]
+    
+    if not available_keys:
+        return None
+    
+    # 現在のインデックスが範囲外なら0にリセット
+    if st.session_state.current_api_key_index >= len(API_KEYS):
+        st.session_state.current_api_key_index = 0
+    
+    return API_KEYS[st.session_state.current_api_key_index]
+
+def switch_to_next_api_key():
+    """次のAPIキーに切り替える"""
+    # 現在のキーを失敗リストに追加
+    st.session_state.failed_api_keys.add(st.session_state.current_api_key_index)
+    
+    # 次の利用可能なキーを探す
+    for i in range(len(API_KEYS)):
+        next_index = (st.session_state.current_api_key_index + 1 + i) % len(API_KEYS)
+        if next_index not in st.session_state.failed_api_keys:
+            st.session_state.current_api_key_index = next_index
+            return True
+    
+    return False  # すべてのキーが失敗
 
 def search_phone_number(store_name, prefecture=""):
     """
     SerpAPIを使用して店舗名と都道府県から電話番号を検索する
+    複数のAPIキーに対応し、上限に達したら自動的に次のキーに切り替える
     
     Args:
         store_name (str): 検索する店舗名
@@ -23,61 +84,92 @@ def search_phone_number(store_name, prefecture=""):
     Returns:
         str: 見つかった電話番号、または見つからない場合は空文字列
     """
-    if not SERPAPI_KEY or SERPAPI_KEY == "your_serpapi_key_here":
+    if not API_KEYS:
         return "APIキー未設定"
     
-    try:
-        # 検索クエリを作成（店舗名 + 都道府県 + 電話番号）
-        search_query = f"{store_name}"
-        if prefecture and pd.notna(prefecture) and prefecture != "":
-            search_query += f" {prefecture}"
-        search_query += " 電話番号"
-        
-        # SerpAPIで検索
-        params = {
-            "engine": "google",
-            "q": search_query,
-            "api_key": SERPAPI_KEY,
-            "num": 5,
-            "hl": "ja",
-            "gl": "jp"
-        }
-        
-        search = GoogleSearch(params)
-        results = search.get_dict()
-        
-        # ナレッジグラフから電話番号を取得
-        if "knowledge_graph" in results:
-            kg = results["knowledge_graph"]
-            if "phone" in kg:
-                return kg["phone"]
-        
-        # ローカルパックから電話番号を取得
-        if "local_results" in results and len(results["local_results"]) > 0:
-            local_result = results["local_results"][0]
-            if "phone" in local_result:
-                return local_result["phone"]
-        
-        # オーガニック検索結果から電話番号を抽出（スニペット内）
-        if "organic_results" in results:
-            for result in results["organic_results"][:3]:
-                snippet = result.get("snippet", "")
-                # 簡易的な電話番号パターンマッチング
-                import re
-                phone_patterns = [
-                    r'\d{2,4}-\d{2,4}-\d{4}',
-                    r'\d{3}-\d{4}-\d{4}',
-                    r'\d{10,11}'
-                ]
-                for pattern in phone_patterns:
-                    match = re.search(pattern, snippet)
-                    if match:
-                        return match.group()
-        
-        return "見つかりませんでした"
-        
-    except Exception as e:
-        return f"エラー: {str(e)}"
+    current_key = get_current_api_key()
+    if not current_key:
+        return "全てのAPIキーが上限に達しました"
+    
+    max_retries = len(API_KEYS)  # 最大リトライ回数 = キーの数
+    
+    for retry in range(max_retries):
+        try:
+            # 検索クエリを作成（店舗名 + 都道府県 + 電話番号）
+            search_query = f"{store_name}"
+            if prefecture and pd.notna(prefecture) and prefecture != "":
+                search_query += f" {prefecture}"
+            search_query += " 電話番号"
+            
+            # SerpAPIで検索
+            params = {
+                "engine": "google",
+                "q": search_query,
+                "api_key": current_key,
+                "num": 5,
+                "hl": "ja",
+                "gl": "jp"
+            }
+            
+            search = GoogleSearch(params)
+            results = search.get_dict()
+            
+            # エラーチェック
+            if "error" in results:
+                error_message = results.get("error", "")
+                # クォータエラーや認証エラーの場合は次のキーに切り替え
+                if "quota" in error_message.lower() or "limit" in error_message.lower() or "credits" in error_message.lower():
+                    if switch_to_next_api_key():
+                        current_key = get_current_api_key()
+                        continue  # 次のキーでリトライ
+                    else:
+                        return "全てのAPIキーが上限に達しました"
+                else:
+                    return f"APIエラー: {error_message}"
+            
+            # ナレッジグラフから電話番号を取得
+            if "knowledge_graph" in results:
+                kg = results["knowledge_graph"]
+                if "phone" in kg:
+                    return kg["phone"]
+            
+            # ローカルパックから電話番号を取得
+            if "local_results" in results and len(results["local_results"]) > 0:
+                local_result = results["local_results"][0]
+                if "phone" in local_result:
+                    return local_result["phone"]
+            
+            # オーガニック検索結果から電話番号を抽出（スニペット内）
+            if "organic_results" in results:
+                for result in results["organic_results"][:3]:
+                    snippet = result.get("snippet", "")
+                    # 簡易的な電話番号パターンマッチング
+                    import re
+                    phone_patterns = [
+                        r'\d{2,4}-\d{2,4}-\d{4}',
+                        r'\d{3}-\d{4}-\d{4}',
+                        r'\d{10,11}'
+                    ]
+                    for pattern in phone_patterns:
+                        match = re.search(pattern, snippet)
+                        if match:
+                            return match.group()
+            
+            return "見つかりませんでした"
+            
+        except Exception as e:
+            error_str = str(e)
+            # APIクォータエラーの場合は次のキーに切り替え
+            if "quota" in error_str.lower() or "limit" in error_str.lower() or "429" in error_str:
+                if switch_to_next_api_key():
+                    current_key = get_current_api_key()
+                    continue  # 次のキーでリトライ
+                else:
+                    return "全てのAPIキーが上限に達しました"
+            else:
+                return f"エラー: {error_str}"
+    
+    return "全てのAPIキーが上限に達しました"
 
 def process_excel(uploaded_file, preview_only=False):
     """
@@ -189,12 +281,46 @@ def main():
     st.markdown("---")
     
     # APIキーの確認
-    if not SERPAPI_KEY or SERPAPI_KEY == "your_serpapi_key_here":
-        st.error("⚠️ SerpAPIキーが設定されていません。.envファイルにAPIキーを設定してください。")
-        st.info("1. https://serpapi.com/ でアカウントを作成\n2. APIキーを取得\n3. .envファイルに SERPAPI_KEY=あなたのAPIキー を設定")
+    if not API_KEYS:
+        st.error("⚠️ SerpAPIキーが設定されていません。")
+        
+        with st.expander("🔑 設定方法"):
+            st.markdown("""
+            ### Streamlit Cloudの場合：
+            1. アプリの「⋮」→「Settings」→「Secrets」タブ
+            2. 以下の形式で入力：
+            ```toml
+            SERPAPI_KEY = "あなたのAPIキー1"
+            SERPAPI_KEY2 = "あなたのAPIキー2"
+            SERPAPI_KEY3 = "あなたのAPIキー3"
+            ```
+            
+            ### ローカル環境の場合：
+            1. `.env`ファイルに以下を記載：
+            ```
+            SERPAPI_KEY=あなたのAPIキー1
+            SERPAPI_KEY2=あなたのAPIキー2
+            SERPAPI_KEY3=あなたのAPIキー3
+            ```
+            
+            ### APIキーの取得：
+            1. https://serpapi.com/ でアカウントを作成
+            2. APIキーを取得（複数のアカウントで複数のキーを取得可能）
+            """)
         return
     
-    st.success("✅ SerpAPIキーが設定されています")
+    # APIキーの状態を表示
+    available_keys = len(API_KEYS) - len(st.session_state.failed_api_keys)
+    
+    if available_keys > 0:
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            st.success(f"✅ SerpAPIキー: {len(API_KEYS)}個設定済み")
+        with col2:
+            st.info(f"利用可能: {available_keys}/{len(API_KEYS)}")
+    else:
+        st.error(f"⚠️ 全てのAPIキー({len(API_KEYS)}個)が上限に達しています")
+        st.info("新しいAPIキーを追加するか、翌月までお待ちください。")
     
     # 使い方の説明
     with st.expander("📖 使い方"):
